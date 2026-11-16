@@ -1,9 +1,62 @@
 /**
  * AI Attendance System — Frontend Controller
- * Handles video upload, WebSocket progress streaming, attendance logs, and student directory.
+ * Handles video upload, WebSocket progress streaming, attendance logs, student directory,
+ * and remote/ngrok backend configuration for Vercel deployment.
  */
 
 document.addEventListener('DOMContentLoaded', () => {
+  // ─── Backend URL Management (Vercel & ngrok Support) ─────────
+  const STORAGE_KEY_BACKEND_URL = 'idp_backend_url';
+
+  function getBackendUrl() {
+    const saved = localStorage.getItem(STORAGE_KEY_BACKEND_URL);
+    if (saved && saved.trim()) {
+      return saved.trim().replace(/\/+$/, ''); // Strip trailing slashes
+    }
+    return '';
+  }
+
+  function setBackendUrl(url) {
+    if (!url || !url.trim()) {
+      localStorage.removeItem(STORAGE_KEY_BACKEND_URL);
+    } else {
+      localStorage.setItem(STORAGE_KEY_BACKEND_URL, url.trim().replace(/\/+$/, ''));
+    }
+  }
+
+  function getApiUrl(path) {
+    const base = getBackendUrl();
+    const cleanPath = path.startsWith('/') ? path : '/' + path;
+    return base ? `${base}${cleanPath}` : cleanPath;
+  }
+
+  function getWsUrl(taskId) {
+    const base = getBackendUrl();
+    if (base) {
+      const isSecure = base.startsWith('https://');
+      const host = base.replace(/^https?:\/\//, '');
+      const wsProto = isSecure ? 'wss:' : 'ws:';
+      return `${wsProto}//${host}/api/v1/attendance/ws/${taskId}`;
+    }
+    // Default to current host
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}/api/v1/attendance/ws/${taskId}`;
+  }
+
+  /**
+   * Unified fetch wrapper that prepends the configured backend URL
+   * and automatically includes ngrok-skip-browser-warning for seamless free ngrok tunnel support.
+   */
+  async function apiFetch(path, options = {}) {
+    const url = getApiUrl(path);
+    const opts = { ...options };
+    opts.headers = {
+      'ngrok-skip-browser-warning': 'true',
+      ...(opts.headers || {}),
+    };
+    return fetch(url, opts);
+  }
+
   // ─── State ───────────────────────────────────────────────────
   let selectedVideoFile = null;
   let selectedRecordsFile = null;
@@ -15,12 +68,22 @@ document.addEventListener('DOMContentLoaded', () => {
   let currentAttendanceRecords = [];
 
   // ─── DOM Elements ────────────────────────────────────────────
-  // Navigation
+  // Navigation & Header
   const navTabs = document.querySelectorAll('.nav-tab');
   const tabPanes = document.querySelectorAll('.tab-pane');
   const deviceBadge = document.getElementById('device-badge');
   const statusIndicator = document.getElementById('status-indicator');
   const statusText = document.getElementById('status-text');
+  const btnOpenSettings = document.getElementById('btn-open-settings');
+
+  // Settings Modal
+  const settingsModal = document.getElementById('settings-modal');
+  const settingBackendUrl = document.getElementById('setting-backend-url');
+  const settingsTestStatus = document.getElementById('settings-test-status');
+  const settingsTestDetails = document.getElementById('settings-test-details');
+  const btnTestBackendUrl = document.getElementById('btn-test-backend-url');
+  const btnSaveBackendUrl = document.getElementById('btn-save-backend-url');
+  const btnResetBackendUrl = document.getElementById('btn-reset-backend-url');
 
   // Video Tab
   const videoDropzone = document.getElementById('video-dropzone');
@@ -108,6 +171,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let icon = 'ℹ️';
     if (type === 'success') icon = '✅';
     if (type === 'error') icon = '⚠️';
+    if (type === 'warning') icon = '🔔';
 
     toast.innerHTML = `<span>${icon}</span><span style="flex: 1;">${message}</span>`;
     toastContainer.appendChild(toast);
@@ -155,7 +219,6 @@ document.addEventListener('DOMContentLoaded', () => {
       const targetPane = document.getElementById(targetTabId);
       if (targetPane) targetPane.classList.add('active');
 
-      // Refresh data on tab activation
       if (targetTabId === 'records-tab') {
         loadAttendanceRecords();
       } else if (targetTabId === 'students-tab') {
@@ -171,10 +234,74 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // ─── Backend Settings Modal ──────────────────────────────────
+  if (btnOpenSettings) {
+    btnOpenSettings.addEventListener('click', () => {
+      const currentUrl = getBackendUrl();
+      settingBackendUrl.value = currentUrl;
+      settingsTestStatus.textContent = currentUrl ? 'Custom Host' : 'Same Origin';
+      settingsTestStatus.className = 'badge badge-live';
+      settingsTestDetails.textContent = currentUrl 
+        ? `Target: ${currentUrl}` 
+        : 'Connecting to same host (http://localhost:8000)';
+      openModal(settingsModal);
+    });
+  }
+
+  btnTestBackendUrl.addEventListener('click', async () => {
+    const rawUrl = settingBackendUrl.value.trim().replace(/\/+$/, '');
+    const testUrl = rawUrl ? `${rawUrl}/health` : '/health';
+
+    settingsTestStatus.textContent = 'Testing...';
+    settingsTestStatus.className = 'badge badge-warning';
+    settingsTestDetails.textContent = `Pinging ${testUrl}...`;
+
+    const startTime = performance.now();
+    try {
+      const res = await fetch(testUrl, {
+        headers: { 'ngrok-skip-browser-warning': 'true' }
+      });
+      const latency = Math.round(performance.now() - startTime);
+
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      const data = await res.json();
+
+      settingsTestStatus.textContent = 'Connected (OK)';
+      settingsTestStatus.className = 'badge badge-match';
+      settingsTestDetails.textContent = `Status: ${data.status} │ Device: ${data.device} │ Latency: ${latency}ms`;
+      showToast('Connection to backend succeeded!', 'success');
+    } catch (err) {
+      settingsTestStatus.textContent = 'Failed';
+      settingsTestStatus.className = 'badge badge-absent';
+      settingsTestDetails.textContent = `Error: ${err.message}. Ensure ngrok is running.`;
+      showToast('Could not connect to backend: ' + err.message, 'error');
+    }
+  });
+
+  btnSaveBackendUrl.addEventListener('click', () => {
+    const newUrl = settingBackendUrl.value.trim().replace(/\/+$/, '');
+    setBackendUrl(newUrl);
+    closeModal(settingsModal);
+    showToast(newUrl ? `Backend updated to ${newUrl}` : 'Reset backend to same-origin', 'success');
+    
+    // Re-check health and reload data
+    checkSystemHealth();
+    loadStudents();
+    loadAttendanceRecords();
+  });
+
+  btnResetBackendUrl.addEventListener('click', () => {
+    settingBackendUrl.value = '';
+    setBackendUrl('');
+    settingsTestStatus.textContent = 'Reset to Default';
+    settingsTestStatus.className = 'badge badge-live';
+    settingsTestDetails.textContent = 'Default relative host applied.';
+  });
+
   // ─── System Health Check ─────────────────────────────────────
   async function checkSystemHealth() {
     try {
-      const res = await fetch('/health');
+      const res = await apiFetch('/health');
       if (!res.ok) throw new Error('Health check failed');
       const data = await res.json();
       
@@ -184,7 +311,7 @@ document.addEventListener('DOMContentLoaded', () => {
         deviceBadge.style.color = '#34d399';
         deviceBadge.style.borderColor = 'rgba(16, 185, 129, 0.3)';
       }
-      statusText.textContent = 'Backend Online';
+      statusText.textContent = getBackendUrl() ? 'Tunnel Online' : 'Backend Online';
       statusIndicator.style.color = 'var(--success)';
     } catch (err) {
       statusText.textContent = 'Offline / Error';
@@ -285,7 +412,7 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       btnQuickSample.disabled = true;
       btnQuickSample.textContent = 'Loading classroom.mp4...';
-      const res = await fetch('/sample-video');
+      const res = await apiFetch('/sample-video');
       if (!res.ok) throw new Error('Sample video not found on server');
       const blob = await res.blob();
       const sampleFile = new File([blob], 'classroom.mp4', { type: 'video/mp4' });
@@ -350,7 +477,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const formData = new FormData();
       formData.append('video', selectedVideoFile);
 
-      const res = await fetch('/api/v1/attendance/upload-video', {
+      const res = await apiFetch('/api/v1/attendance/upload-video', {
         method: 'POST',
         body: formData,
       });
@@ -386,9 +513,7 @@ document.addEventListener('DOMContentLoaded', () => {
       pollingInterval = null;
     }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/v1/attendance/ws/${taskId}`;
-
+    const wsUrl = getWsUrl(taskId);
     let socketOpened = false;
 
     try {
@@ -410,7 +535,6 @@ document.addEventListener('DOMContentLoaded', () => {
       };
 
       ws.onerror = () => {
-        // Fallback to polling if WebSocket has an issue
         if (!socketOpened) {
           startPollingFallback(taskId);
         }
@@ -420,7 +544,7 @@ document.addEventListener('DOMContentLoaded', () => {
         activeWebSocket = null;
       };
 
-      // Also set a safety timeout in case WebSocket doesn't fire
+      // Safety timeout in case WebSocket connection doesn't complete
       setTimeout(() => {
         if (!socketOpened) {
           startPollingFallback(taskId);
@@ -437,7 +561,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     pollingInterval = setInterval(async () => {
       try {
-        const res = await fetch(`/api/v1/attendance/status/${taskId}`);
+        const res = await apiFetch(`/api/v1/attendance/status/${taskId}`);
         if (!res.ok) throw new Error('Status poll failed');
         const data = await res.json();
 
@@ -474,7 +598,6 @@ document.addEventListener('DOMContentLoaded', () => {
       updatePipelineSteps('complete');
       pipelineMessage.textContent = message || 'Attendance processing complete!';
 
-      // Fetch complete task result
       fetchTaskFinalResult(currentTaskId);
     } else if (phase === 'error' || update.status === 'error') {
       if (activeWebSocket) activeWebSocket.close();
@@ -489,7 +612,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function fetchTaskFinalResult(taskId) {
     try {
-      const res = await fetch(`/api/v1/attendance/status/${taskId}`);
+      const res = await apiFetch(`/api/v1/attendance/status/${taskId}`);
       if (!res.ok) throw new Error('Failed to get final task result');
       const data = await res.json();
       const result = data.result || {};
@@ -497,7 +620,6 @@ document.addEventListener('DOMContentLoaded', () => {
       displayRecognitionResults(result);
       showToast('Attendance successfully processed and recorded!', 'success');
 
-      // Refresh records and enrolled student lists
       loadAttendanceRecords();
       loadStudents();
 
@@ -539,11 +661,12 @@ document.addEventListener('DOMContentLoaded', () => {
         const enrollId = studentInfo.enrollment_id || rec.student_id;
         const confidencePct = Math.round(rec.confidence_score * 100);
         const livenessPct = Math.round(rec.liveness_score * 100);
+        const photoUrl = getApiUrl(`/api/v1/students/${rec.student_id}/photo`);
 
         const card = document.createElement('div');
         card.className = 'student-card';
         card.innerHTML = `
-          <img class="student-avatar" src="/api/v1/students/${rec.student_id}/photo" 
+          <img class="student-avatar" src="${photoUrl}" 
                onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" 
                alt="${rec.student_name}">
           <div class="student-avatar-placeholder" style="display: none;">
@@ -607,10 +730,9 @@ document.addEventListener('DOMContentLoaded', () => {
     `;
 
     try {
-      // Fetch both history and total enrolled students for stats calculation
       const [historyRes, studentsRes] = await Promise.all([
-        fetch(`/api/v1/attendance/history?date=${selectedDate}`),
-        fetch('/api/v1/students'),
+        apiFetch(`/api/v1/attendance/history?date=${selectedDate}`),
+        apiFetch('/api/v1/students'),
       ]);
 
       if (!historyRes.ok) throw new Error('Failed to fetch attendance history');
@@ -627,7 +749,6 @@ document.addEventListener('DOMContentLoaded', () => {
       const absentCount = Math.max(0, totalEnrolled - presentCount);
       const ratePct = totalEnrolled > 0 ? Math.round((presentCount / totalEnrolled) * 100) : 0;
 
-      // Update stat cards
       statsTotalEnrolled.textContent = totalEnrolled;
       statsPresent.textContent = presentCount;
       statsAbsent.textContent = absentCount;
@@ -671,6 +792,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const studentName = r.student_name || student.name || 'Unknown';
       const confPct = Math.round((r.confidence_score || 0) * 100);
       const livePct = Math.round((r.liveness_score || 1) * 100);
+      const photoUrl = getApiUrl(`/api/v1/students/${r.student_id}/photo`);
       
       let formattedTime = '-';
       if (r.timestamp) {
@@ -687,7 +809,7 @@ document.addEventListener('DOMContentLoaded', () => {
       tr.innerHTML = `
         <td>
           <img class="student-avatar" style="width: 38px; height: 38px; border-radius: var(--radius-sm);" 
-               src="/api/v1/students/${r.student_id}/photo" 
+               src="${photoUrl}" 
                onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" 
                alt="${studentName}">
           <div class="student-avatar-placeholder" style="width: 38px; height: 38px; font-size: 0.85rem; display: none;">
@@ -733,7 +855,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     try {
-      const res = await fetch('/api/v1/attendance/clear', { method: 'POST' });
+      const res = await apiFetch('/api/v1/attendance/clear', { method: 'POST' });
       if (!res.ok) throw new Error('Clear failed');
       showToast('All attendance logs cleared.', 'info');
       loadAttendanceRecords();
@@ -745,7 +867,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Export CSV
   btnExportCsv.addEventListener('click', () => {
     const date = recordsDatePicker.value;
-    window.open(`/api/v1/attendance/export?date=${date}`, '_blank');
+    window.open(getApiUrl(`/api/v1/attendance/export?date=${date}`), '_blank');
     showToast(`Exporting attendance CSV for ${date}...`, 'info');
   });
 
@@ -805,7 +927,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const formData = new FormData();
       formData.append('file', selectedRecordsFile);
 
-      const res = await fetch('/api/v1/attendance/upload-records', {
+      const res = await apiFetch('/api/v1/attendance/upload-records', {
         method: 'POST',
         body: formData,
       });
@@ -858,7 +980,7 @@ UG/04/BTCSE/2025/251,Jaydeep Dey,${today}T09:30:00Z,0.91,1.0`;
     `;
 
     try {
-      const res = await fetch('/api/v1/students');
+      const res = await apiFetch('/api/v1/students');
       if (!res.ok) throw new Error('Failed to load students');
       const data = await res.json();
       allEnrolledStudents = data.students || [];
@@ -902,11 +1024,13 @@ UG/04/BTCSE/2025/251,Jaydeep Dey,${today}T09:30:00Z,0.91,1.0`;
         }
       }
 
+      const photoUrl = getApiUrl(`/api/v1/students/${s.id}/photo`);
+
       const card = document.createElement('div');
       card.className = 'student-card';
       card.setAttribute('data-student-search', `${s.name} ${s.enrollment_id}`.toLowerCase());
       card.innerHTML = `
-        <img class="student-avatar" src="/api/v1/students/${s.id}/photo" 
+        <img class="student-avatar" src="${photoUrl}" 
              onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" 
              alt="${s.name}">
         <div class="student-avatar-placeholder" style="display: none;">
@@ -924,7 +1048,6 @@ UG/04/BTCSE/2025/251,Jaydeep Dey,${today}T09:30:00Z,0.91,1.0`;
       studentsDirectoryGrid.appendChild(card);
     });
 
-    // Attach delete handlers
     document.querySelectorAll('[data-delete-student]').forEach(btn => {
       btn.addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -936,7 +1059,7 @@ UG/04/BTCSE/2025/251,Jaydeep Dey,${today}T09:30:00Z,0.91,1.0`;
         }
 
         try {
-          const res = await fetch(`/api/v1/students/${studentId}`, { method: 'DELETE' });
+          const res = await apiFetch(`/api/v1/students/${studentId}`, { method: 'DELETE' });
           if (!res.ok) throw new Error('Delete failed');
           showToast(`Student "${sName}" deleted.`, 'info');
           loadStudents();
@@ -1003,7 +1126,7 @@ UG/04/BTCSE/2025/251,Jaydeep Dey,${today}T09:30:00Z,0.91,1.0`;
       formData.append('enrollment_id', id);
       formData.append('image', selectedEnrollImage);
 
-      const res = await fetch('/api/v1/students/enroll', {
+      const res = await apiFetch('/api/v1/students/enroll', {
         method: 'POST',
         body: formData,
       });
@@ -1028,6 +1151,11 @@ UG/04/BTCSE/2025/251,Jaydeep Dey,${today}T09:30:00Z,0.91,1.0`;
   });
 
   // ─── Initial Startup ─────────────────────────────────────────
+  // If hosted on Vercel or cloud and no backend URL is set, notify the user
+  if (window.location.hostname.includes('vercel.app') && !getBackendUrl()) {
+    showToast('Deployed on Vercel: Click "API Server" in the top bar to set your ngrok URL.', 'warning', 7000);
+  }
+
   checkSystemHealth();
   loadStudents();
   loadAttendanceRecords();

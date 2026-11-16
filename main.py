@@ -147,6 +147,18 @@ async def root():
     }
 
 
+@app.get("/styles.css", include_in_schema=False)
+async def get_styles():
+    """Serve styles.css for root-level asset resolution."""
+    return FileResponse(str(FRONTEND_DIR / "styles.css"), media_type="text/css")
+
+
+@app.get("/app.js", include_in_schema=False)
+async def get_app_js():
+    """Serve app.js for root-level asset resolution."""
+    return FileResponse(str(FRONTEND_DIR / "app.js"), media_type="application/javascript")
+
+
 @app.get("/health", tags=["health"])
 async def health_check():
     """Detailed health check."""
